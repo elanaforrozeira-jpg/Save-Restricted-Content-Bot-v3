@@ -1,4 +1,4 @@
-# Ruhvaan Bot - Entry Point (Railway/Render)
+# Ruhvaan Bot - Entry Point
 
 import asyncio
 import importlib
@@ -15,48 +15,66 @@ logger = logging.getLogger(__name__)
 PLUGIN_DIR = "plugins"
 
 def load_plugins():
+    """Import all plugin modules so handlers get registered on the app object."""
+    loaded = 0
     for fname in sorted(os.listdir(PLUGIN_DIR)):
         if fname.endswith(".py") and not fname.startswith("_"):
             mod = f"{PLUGIN_DIR}.{fname[:-3]}"
             try:
                 importlib.import_module(mod)
-                logger.info(f"Loaded: {mod}")
+                logger.info(f"[+] Plugin loaded: {fname}")
+                loaded += 1
             except Exception as e:
-                logger.error(f"Failed {mod}: {e}")
+                logger.error(f"[!] Plugin FAILED {fname}: {e}")
+    logger.info(f"[Ruhvaan] {loaded} plugins loaded.")
 
 async def run():
-    from shared_client import start_client, client, app
+    # Step 1: Import clients
+    from shared_client import app, client, userbot, BOT_TOKEN_INT
+
+    # Step 2: Load all plugins BEFORE starting (handlers register on app)
     load_plugins()
-    await start_client()
-    logger.info("[Ruhvaan Bot] Running... Press Ctrl+C to stop.")
+    logger.info("[Ruhvaan] Plugins loaded. Starting clients...")
 
-    # Keep bot alive: Telethon runs its own loop, Pyrogram just needs to stay open
-    stop_event = asyncio.Event()
+    # Step 3: Start Pyrogram bot
+    await app.start()
+    logger.info("[Ruhvaan] Pyrogram bot started.")
 
-    async def telethon_task():
-        await client.run_until_disconnected()
-        stop_event.set()
+    # Step 4: Start Telethon client
+    from config import BOT_TOKEN
+    await client.start(bot_token=BOT_TOKEN)
+    logger.info("[Ruhvaan] Telethon client started.")
 
-    async def pyrogram_task():
-        # Pyrogram 2.x: keep alive by waiting for stop event
-        await stop_event.wait()
+    # Step 5: Start userbot if STRING is set
+    if userbot:
+        try:
+            await userbot.start()
+            logger.info("[Ruhvaan] Userbot started.")
+        except Exception as e:
+            logger.error(f"[Ruhvaan] Userbot error: {e}")
 
+    logger.info("[Ruhvaan] Bot is LIVE and responding!")
+
+    # Step 6: Keep alive
+    await asyncio.gather(
+        client.run_until_disconnected()
+    )
+
+async def shutdown(app, client, userbot):
+    try: await app.stop()
+    except: pass
+    try: await client.disconnect()
+    except: pass
+    if userbot:
+        try: await userbot.stop()
+        except: pass
+
+if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        await asyncio.gather(
-            telethon_task(),
-            pyrogram_task()
-        )
+        loop.run_until_complete(run())
     except (KeyboardInterrupt, SystemExit):
         logger.info("[Ruhvaan] Shutting down...")
     finally:
-        try:
-            await app.stop()
-        except Exception as e:
-            logger.error(f"App stop error: {e}")
-        try:
-            await client.disconnect()
-        except Exception as e:
-            logger.error(f"Client disconnect error: {e}")
-
-if __name__ == "__main__":
-    asyncio.run(run())
+        loop.close()
