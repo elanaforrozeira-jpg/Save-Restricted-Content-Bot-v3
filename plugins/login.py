@@ -1,285 +1,288 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# Ruhvaan Bot - QR Login System
+# QR-based Telegram login (no phone number needed)
 
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import BadRequest, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired, MessageNotModified
-import logging
+import asyncio
 import os
-from config import API_HASH, API_ID
+import logging
+import qrcode
+import io
+from pyrogram import Client, filters
+from pyrogram.errors import SessionPasswordNeeded, BadRequest, MessageNotModified
+from config import API_ID, API_HASH
 from shared_client import app as bot
 from utils.func import save_user_session, get_user_data, remove_user_session, save_user_bot, remove_user_bot
 from utils.encrypt import ecs, dcs
 from plugins.batch import UB, UC
-from utils.custom_filters import login_in_progress, set_user_step, get_user_step
+from utils.custom_filters import set_user_step, get_user_step
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-model = "v3saver Team SPY"
 
-STEP_PHONE = 1
-STEP_CODE = 2
-STEP_PASSWORD = 3
-login_cache = {}
+# Track QR login sessions
+qr_sessions = {}
+qr_tasks = {}
 
-@bot.on_message(filters.command('login'))
-async def login_command(client, message):
-    user_id = message.from_user.id
-    set_user_step(user_id, STEP_PHONE)
-    login_cache.pop(user_id, None)
-    await message.delete()
-    status_msg = await message.reply(
-        """Please send your phone number with country code
-Example: `+12345678900`"""
-        )
-    login_cache[user_id] = {'status_msg': status_msg}
-    
-    
-@bot.on_message(filters.command("setbot"))
-async def set_bot_token(C, m):
-    user_id = m.from_user.id
-    args = m.text.split(" ", 1)
-    if user_id in UB:
-        try:
-            await UB[user_id].stop()
-            if UB.get(user_id, None):
-                del UB[user_id]  # Remove from dictionary
-                
+# ─── QR LOGIN ─────────────────────────────────────────────────────────────────
+
+async def _generate_qr_image(token: str) -> bytes:
+    """Generate QR code bytes from token URL."""
+    url = f"tg://login?token={token}"
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.read()
+
+async def _qr_login_task(client_obj, user_id: int, status_msg, bot_client):
+    """Background task that refreshes QR and waits for scan."""
+    try:
+        while True:
             try:
-                if os.path.exists(f"user_{user_id}.session"):
-                    os.remove(f"user_{user_id}.session")
-            except Exception:
-                pass
-            
-            print(f"Stopped and removed old bot for user {user_id}")
-        except Exception as e:
-            print(f"Error stopping old bot for user {user_id}: {e}")
-            del UB[user_id]  # Remove from dictionary
+                qr_login = await client_obj.qr_login()
+                token = qr_login.url.split("token=")[-1] if "token=" in qr_login.url else qr_login.url
+                img_bytes = await _generate_qr_image(token)
 
-    if len(args) < 2:
-        await m.reply_text("⚠️ Please provide a bot token. Usage: `/setbto token`", quote=True)
+                # Edit caption + send QR
+                try:
+                    await status_msg.delete()
+                except: pass
+                status_msg = await bot_client.send_photo(
+                    chat_id=user_id,
+                    photo=img_bytes,
+                    caption=(
+                        "📱 **Scan this QR code in Telegram**\n\n"
+                        "1. Open Telegram on your phone\n"
+                        "2. Go to **Settings → Devices → Link Desktop Device**\n"
+                        "3. Scan the QR code above\n\n"
+                        "⏳ QR expires in 30 seconds — auto-refreshes\n"
+                        "❌ Use /cancel to abort"
+                    )
+                )
+                qr_sessions[user_id]["status_msg"] = status_msg
+
+                # Wait for scan (30s timeout per QR)
+                try:
+                    await asyncio.wait_for(qr_login.wait(), timeout=30)
+                    # ── SUCCESS ──
+                    session_string = await client_obj.export_session_string()
+                    encrypted = ecs(session_string)
+                    await save_user_session(user_id, encrypted)
+                    await client_obj.disconnect()
+                    qr_sessions.pop(user_id, None)
+                    qr_tasks.pop(user_id, None)
+                    set_user_step(user_id, None)
+                    try:
+                        await status_msg.delete()
+                    except: pass
+                    await bot_client.send_message(
+                        user_id,
+                        "✅ **Logged in successfully!**\n\nYou can now use /batch to extract files from private channels."
+                    )
+                    return
+                except asyncio.TimeoutError:
+                    # QR expired → loop regenerates
+                    continue
+                except SessionPasswordNeeded:
+                    # 2FA needed
+                    qr_sessions[user_id]["step"] = "password"
+                    qr_sessions[user_id]["client"] = client_obj
+                    set_user_step(user_id, 99)  # password step marker
+                    try:
+                        await status_msg.delete()
+                    except: pass
+                    await bot_client.send_message(
+                        user_id,
+                        "🔒 **Two-step verification enabled.**\n\nPlease send your password:"
+                    )
+                    return
+
+            except Exception as ex:
+                logger.error(f"[QR] loop error for {user_id}: {ex}")
+                await asyncio.sleep(3)
+                continue
+
+    except asyncio.CancelledError:
+        try:
+            await client_obj.disconnect()
+        except: pass
+        qr_sessions.pop(user_id, None)
+
+
+@bot.on_message(filters.command("login") & filters.private)
+async def login_command(bot_client, message):
+    user_id = message.from_user.id
+
+    # Cancel existing
+    if user_id in qr_tasks and not qr_tasks[user_id].done():
+        qr_tasks[user_id].cancel()
+    if user_id in qr_sessions and "client" in qr_sessions[user_id]:
+        try:
+            await qr_sessions[user_id]["client"].disconnect()
+        except: pass
+    qr_sessions.pop(user_id, None)
+
+    await message.delete()
+    status_msg = await message.reply("🔄 Starting QR login...")
+    set_user_step(user_id, 1)
+
+    temp_client = Client(
+        f"ruhvaan_qr_{user_id}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True
+    )
+    try:
+        await temp_client.connect()
+    except Exception as ex:
+        await status_msg.edit(f"❌ Connection error: {ex}")
         return
 
-    bot_token = args[1].strip()
-    await save_user_bot(user_id, bot_token)
-    await m.reply_text("✅ Bot token saved successfully.", quote=True)
-    
-    
-@bot.on_message(filters.command("rembot"))
-async def rem_bot_token(C, m):
-    user_id = m.from_user.id
+    qr_sessions[user_id] = {"client": temp_client, "status_msg": status_msg}
+    task = asyncio.create_task(_qr_login_task(temp_client, user_id, status_msg, bot_client))
+    qr_tasks[user_id] = task
+
+
+# ─── 2FA PASSWORD HANDLER ─────────────────────────────────────────────────────
+
+@bot.on_message(
+    filters.private & filters.text &
+    ~filters.command(["start", "batch", "cancel", "login", "logout", "stop", "set", "setbot", "rembot"])
+)
+async def handle_2fa_password(bot_client, message):
+    user_id = message.from_user.id
+    step = get_user_step(user_id)
+    if step != 99:
+        return  # Not in 2FA step
+
+    text = message.text.strip()
+    session_info = qr_sessions.get(user_id, {})
+    client_obj = session_info.get("client")
+    if not client_obj:
+        await message.reply("❌ Session expired. Please use /login again.")
+        set_user_step(user_id, None)
+        return
+
+    try:
+        await message.delete()
+    except: pass
+
+    prog = await message.reply("🔄 Verifying password...")
+    try:
+        await client_obj.check_password(text)
+        session_string = await client_obj.export_session_string()
+        encrypted = ecs(session_string)
+        await save_user_session(user_id, encrypted)
+        await client_obj.disconnect()
+        qr_sessions.pop(user_id, None)
+        set_user_step(user_id, None)
+        await prog.edit("✅ **Logged in successfully!**\n\nYou can now use /batch.")
+    except BadRequest as ex:
+        await prog.edit(f"❌ Wrong password: {ex}\n\nTry again or /cancel")
+    except Exception as ex:
+        await prog.edit(f"❌ Error: {ex}")
+        set_user_step(user_id, None)
+
+
+# ─── CANCEL ───────────────────────────────────────────────────────────────────
+
+@bot.on_message(filters.command("cancel") & filters.private)
+async def cancel_command(bot_client, message):
+    user_id = message.from_user.id
+    await message.delete()
+
+    cancelled = False
+    if user_id in qr_tasks and not qr_tasks[user_id].done():
+        qr_tasks[user_id].cancel()
+        cancelled = True
+    if user_id in qr_sessions:
+        try:
+            if "client" in qr_sessions[user_id]:
+                await qr_sessions[user_id]["client"].disconnect()
+        except: pass
+        try:
+            if "status_msg" in qr_sessions[user_id]:
+                await qr_sessions[user_id]["status_msg"].delete()
+        except: pass
+        qr_sessions.pop(user_id, None)
+        cancelled = True
+
+    set_user_step(user_id, None)
+    msg = await message.reply(
+        "✅ Login cancelled." if cancelled else "ℹ️ No active login session."
+    )
+    await asyncio.sleep(4)
+    try: await msg.delete()
+    except: pass
+
+
+# ─── LOGOUT ───────────────────────────────────────────────────────────────────
+
+@bot.on_message(filters.command("logout") & filters.private)
+async def logout_command(bot_client, message):
+    user_id = message.from_user.id
+    await message.delete()
+    prog = await message.reply("🔄 Logging out...")
+    try:
+        session_data = await get_user_data(user_id)
+        if not session_data or "session_string" not in session_data:
+            await prog.edit("❌ No active session found.")
+            return
+        session_string = dcs(session_data["session_string"])
+        temp = Client(f"ruhvaan_logout_{user_id}", api_id=API_ID, api_hash=API_HASH, session_string=session_string)
+        try:
+            await temp.connect()
+            await temp.log_out()
+        except Exception as ex:
+            logger.error(f"Logout session error: {ex}")
+        finally:
+            try: await temp.disconnect()
+            except: pass
+        await remove_user_session(user_id)
+        if UC.get(user_id):
+            del UC[user_id]
+        for f in [f"{user_id}_client.session", f"ruhvaan_qr_{user_id}.session"]:
+            try:
+                if os.path.exists(f): os.remove(f)
+            except: pass
+        await prog.edit("✅ Logged out successfully!")
+    except Exception as ex:
+        await prog.edit(f"❌ Error during logout: {ex}")
+        try: await remove_user_session(user_id)
+        except: pass
+
+
+# ─── SETBOT / REMBOT ──────────────────────────────────────────────────────────
+
+@bot.on_message(filters.command("setbot") & filters.private)
+async def set_bot_token(_, message):
+    user_id = message.from_user.id
     if user_id in UB:
         try:
             await UB[user_id].stop()
-            
-            if UB.get(user_id, None):
-                del UB[user_id]  # Remove from dictionary # Remove from dictionary
-            print(f"Stopped and removed old bot for user {user_id}")
-            try:
-                if os.path.exists(f"user_{user_id}.session"):
-                    os.remove(f"user_{user_id}.session")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"Error stopping old bot for user {user_id}: {e}")
-            if UB.get(user_id, None):
-                del UB[user_id]  # Remove from dictionary  # Remove from dictionary
-            try:
-                if os.path.exists(f"user_{user_id}.session"):
-                    os.remove(f"user_{user_id}.session")
-            except Exception:
-                pass
-    await remove_user_bot(user_id)
-    await m.reply_text("✅ Bot token removed successfully.", quote=True)
+            del UB[user_id]
+        except: pass
+    args = message.text.split(" ", 1)
+    if len(args) < 2:
+        await message.reply("⚠️ Usage: `/setbot token`")
+        return
+    await save_user_bot(user_id, args[1].strip())
+    await message.reply("✅ Custom bot token saved.")
 
-    
-@bot.on_message(login_in_progress & filters.text & filters.private & ~filters.command([
-    'start', 'batch', 'cancel', 'login', 'logout', 'stop', 'set', 'pay',
-    'redeem', 'gencode', 'generate', 'keyinfo', 'encrypt', 'decrypt', 'keys', 'setbot', 'rembot']))
-async def handle_login_steps(client, message):
+
+@bot.on_message(filters.command("rembot") & filters.private)
+async def rem_bot_token(_, message):
     user_id = message.from_user.id
-    text = message.text.strip()
-    step = get_user_step(user_id)
-    try:
-        await message.delete()
-    except Exception as e:
-        logger.warning(f'Could not delete message: {e}')
-    status_msg = login_cache[user_id].get('status_msg')
-    if not status_msg:
-        status_msg = await message.reply('Processing...')
-        login_cache[user_id]['status_msg'] = status_msg
-    try:
-        if step == STEP_PHONE:
-            if not text.startswith('+'):
-                await edit_message_safely(status_msg,
-                    '❌ Please provide a valid phone number starting with +')
-                return
-            await edit_message_safely(status_msg,
-                '🔄 Processing phone number...')
-            temp_client = Client(f'temp_{user_id}', api_id=API_ID, api_hash
-                =API_HASH, device_model=model, in_memory=True)
-            try:
-                await temp_client.connect()
-                sent_code = await temp_client.send_code(text)
-                login_cache[user_id]['phone'] = text
-                login_cache[user_id]['phone_code_hash'
-                    ] = sent_code.phone_code_hash
-                login_cache[user_id]['temp_client'] = temp_client
-                set_user_step(user_id, STEP_CODE)
-                await edit_message_safely(status_msg,
-                    """✅ Verification code sent to your Telegram account.
-                    
-Please enter the code you received like 1 2 3 4 5 (i.e seperated by space):"""
-                    )
-            except BadRequest as e:
-                await edit_message_safely(status_msg,
-                    f"""❌ Error: {str(e)}
-Please try again with /login.""")
-                await temp_client.disconnect()
-                set_user_step(user_id, None)
-        elif step == STEP_CODE:
-            code = text.replace(' ', '')
-            phone = login_cache[user_id]['phone']
-            phone_code_hash = login_cache[user_id]['phone_code_hash']
-            temp_client = login_cache[user_id]['temp_client']
-            try:
-                await edit_message_safely(status_msg, '🔄 Verifying code...')
-                await temp_client.sign_in(phone, phone_code_hash, code)
-                session_string = await temp_client.export_session_string()
-                encrypted_session = ecs(session_string)
-                await save_user_session(user_id, encrypted_session)
-                await temp_client.disconnect()
-                temp_status_msg = login_cache[user_id]['status_msg']
-                login_cache.pop(user_id, None)
-                login_cache[user_id] = {'status_msg': temp_status_msg}
-                await edit_message_safely(status_msg,
-                    """✅ Logged in successfully!!"""
-                    )
-                set_user_step(user_id, None)
-            except SessionPasswordNeeded:
-                set_user_step(user_id, STEP_PASSWORD)
-                await edit_message_safely(status_msg,
-                    """🔒 Two-step verification is enabled.
-Please enter your password:"""
-                    )
-            except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-                await edit_message_safely(status_msg,
-                    f'❌ {str(e)}. Please try again with /login.')
-                await temp_client.disconnect()
-                login_cache.pop(user_id, None)
-                set_user_step(user_id, None)
-        elif step == STEP_PASSWORD:
-            temp_client = login_cache[user_id]['temp_client']
-            try:
-                await edit_message_safely(status_msg, '🔄 Verifying password...'
-                    )
-                await temp_client.check_password(text)
-                session_string = await temp_client.export_session_string()
-                encrypted_session = ecs(session_string)
-                await save_user_session(user_id, encrypted_session)
-                await temp_client.disconnect()
-                temp_status_msg = login_cache[user_id]['status_msg']
-                login_cache.pop(user_id, None)
-                login_cache[user_id] = {'status_msg': temp_status_msg}
-                await edit_message_safely(status_msg,
-                    """✅ Logged in successfully!!"""
-                    )
-                set_user_step(user_id, None)
-            except BadRequest as e:
-                await edit_message_safely(status_msg,
-                    f"""❌ Incorrect password: {str(e)}
-Please try again:""")
-    except Exception as e:
-        logger.error(f'Error in login flow: {str(e)}')
-        await edit_message_safely(status_msg,
-            f"""❌ An error occurred: {str(e)}
-Please try again with /login.""")
-        if user_id in login_cache and 'temp_client' in login_cache[user_id]:
-            await login_cache[user_id]['temp_client'].disconnect()
-        login_cache.pop(user_id, None)
-        set_user_step(user_id, None)
-async def edit_message_safely(message, text):
-    """Helper function to edit message and handle errors"""
-    try:
-        await message.edit(text)
-    except MessageNotModified:
-        pass
-    except Exception as e:
-        logger.error(f'Error editing message: {e}')
-        
-@bot.on_message(filters.command('cancel'))
-async def cancel_command(client, message):
-    user_id = message.from_user.id
-    await message.delete()
-    if get_user_step(user_id):
-        status_msg = login_cache.get(user_id, {}).get('status_msg')
-        if user_id in login_cache and 'temp_client' in login_cache[user_id]:
-            await login_cache[user_id]['temp_client'].disconnect()
-        login_cache.pop(user_id, None)
-        set_user_step(user_id, None)
-        if status_msg:
-            await edit_message_safely(status_msg,
-                '✅ Login process cancelled. Use /login to start again.')
-        else:
-            temp_msg = await message.reply(
-                '✅ Login process cancelled. Use /login to start again.')
-            await temp_msg.delete(5)
-    else:
-        temp_msg = await message.reply('No active login process to cancel.')
-        await temp_msg.delete(5)
-        
-@bot.on_message(filters.command('logout'))
-async def logout_command(client, message):
-    user_id = message.from_user.id
-    await message.delete()
-    status_msg = await message.reply('🔄 Processing logout request...')
-    try:
-        session_data = await get_user_data(user_id)
-        
-        if not session_data or 'session_string' not in session_data:
-            await edit_message_safely(status_msg,
-                '❌ No active session found for your account.')
-            return
-        encss = session_data['session_string']
-        session_string = dcs(encss)
-        temp_client = Client(f'temp_logout_{user_id}', api_id=API_ID,
-            api_hash=API_HASH, session_string=session_string)
+    if user_id in UB:
         try:
-            await temp_client.connect()
-            await temp_client.log_out()
-            await edit_message_safely(status_msg,
-                '✅ Telegram session terminated successfully. Removing from database...'
-                )
-        except Exception as e:
-            logger.error(f'Error terminating session: {str(e)}')
-            await edit_message_safely(status_msg,
-                f"""⚠️ Error terminating Telegram session: {str(e)}
-Still removing from database..."""
-                )
-        finally:
-            await temp_client.disconnect()
-        await remove_user_session(user_id)
-        await edit_message_safely(status_msg,
-            '✅ Logged out successfully!!')
+            await UB[user_id].stop()
+            del UB[user_id]
+        except: pass
+    await remove_user_bot(user_id)
+    for f in [f"user_{user_id}.session"]:
         try:
-            if os.path.exists(f"{user_id}_client.session"):
-                os.remove(f"{user_id}_client.session")
-        except Exception:
-            pass
-        if UC.get(user_id, None):
-            del UC[user_id]
-    except Exception as e:
-        logger.error(f'Error in logout command: {str(e)}')
-        try:
-            await remove_user_session(user_id)
-        except Exception:
-            pass
-        if UC.get(user_id, None):
-            del UC[user_id]
-        await edit_message_safely(status_msg,
-            f'❌ An error occurred during logout: {str(e)}')
-        try:
-            if os.path.exists(f"{user_id}_client.session"):
-                os.remove(f"{user_id}_client.session")
-        except Exception:
-            pass
+            if os.path.exists(f): os.remove(f)
+        except: pass
+    await message.reply("✅ Custom bot token removed.")

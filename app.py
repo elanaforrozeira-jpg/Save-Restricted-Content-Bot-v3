@@ -1,18 +1,24 @@
-# Copyright (c) 2025 devgagan : https://github.com/devgaganin.  
-# Licensed under the GNU General Public License v3.0.  
-# See LICENSE file in the repository root for full license text.
+# Ruhvaan Bot - Web Health Check (for Railway/Render keep-alive)
 
-import os
-from flask import Flask, render_template
+from flask import Flask
+import threading
+import asyncio
+from main import main
 
-app = Flask(__name__)
+flask_app = Flask(__name__)
 
-@app.route("/")
-def welcome():
-    # Render the welcome page with animated "Team SPY" text
-    return render_template("welcome.html")
+@flask_app.route("/")
+def home():
+    return "<h2>Ruhvaan Bot is running ✅</h2>"
+
+@flask_app.route("/health")
+def health():
+    return {"status": "ok", "bot": "Ruhvaan Bot"}
+
+def run_bot():
+    asyncio.run(main())
 
 if __name__ == "__main__":
-    # Default to port 5000 if PORT is not set in the environment
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    t = threading.Thread(target=run_bot, daemon=True)
+    t.start()
+    flask_app.run(host="0.0.0.0", port=8080)
