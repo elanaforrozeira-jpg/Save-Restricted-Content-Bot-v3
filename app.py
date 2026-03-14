@@ -1,12 +1,9 @@
-# Ruhvaan Bot - Railway Optimized Entry Point
-# Railway requires a web server listening on PORT
-# Bot runs in background thread, Flask handles health checks
+# Ruhvaan Bot - Railway Entry Point
 
 import os
 import sys
 import asyncio
 import logging
-import importlib
 import threading
 
 from flask import Flask
@@ -17,49 +14,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Flask app (Railway needs HTTP on PORT) ──────────────────────
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
-    return "<h1>Ruhvaan Bot ✅ Running</h1>", 200
+    return "<h1>Ruhvaan Bot ✅</h1>", 200
 
 @flask_app.route("/health")
 def health():
-    return {"status": "ok", "bot": "Ruhvaan"}, 200
+    return {"status": "ok"}, 200
 
-# ── Plugin Loader ───────────────────────────────────────────────
-def load_plugins():
-    plugin_dir = "plugins"
-    loaded = 0
-    for fname in sorted(os.listdir(plugin_dir)):
-        if fname.endswith(".py") and not fname.startswith("_"):
-            try:
-                importlib.import_module(f"plugins.{fname[:-3]}")
-                logger.info(f"[+] {fname}")
-                loaded += 1
-            except Exception as e:
-                logger.error(f"[!] {fname} failed: {e}")
-    logger.info(f"[Ruhvaan] {loaded} plugins loaded")
 
-# ── Bot Runner (runs in separate thread) ────────────────────────
 def run_bot():
-    async def _start():
-        # Validate env vars first
-        API_ID    = os.environ.get("API_ID", "")
-        API_HASH  = os.environ.get("API_HASH", "")
-        BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-        STRING    = os.environ.get("STRING", "") or None
+    """Bot runs in its own thread with its own event loop."""
 
-        if not API_ID or not API_HASH or not BOT_TOKEN:
-            logger.error("[FATAL] Missing API_ID / API_HASH / BOT_TOKEN")
-            sys.exit(1)
+    async def _bot():
+        API_ID    = os.environ.get("API_ID", "").strip()
+        API_HASH  = os.environ.get("API_HASH", "").strip()
+        BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+        STRING    = os.environ.get("STRING", "").strip() or None
 
-        from pyrogram import Client
+        if not all([API_ID, API_HASH, BOT_TOKEN]):
+            logger.error("[FATAL] API_ID / API_HASH / BOT_TOKEN missing!")
+            return
+
+        logger.info("[Ruhvaan] Importing libraries...")
+        from pyrogram import Client as PyroClient
         from telethon import TelegramClient
 
-        # Init clients
-        pyro = Client(
+        # 1. Create clients
+        pyro = PyroClient(
             "ruhvaan_pyro",
             api_id=int(API_ID),
             api_hash=API_HASH,
@@ -69,54 +53,74 @@ def run_bot():
 
         userbot = None
         if STRING:
-            userbot = Client(
+            userbot = PyroClient(
                 "ruhvaan_userbot",
                 api_id=int(API_ID),
                 api_hash=API_HASH,
                 session_string=STRING
             )
 
-        # Share globally so plugins can import
+        # 2. Inject into shared_client BEFORE plugins load
         import shared_client as sc
-        sc.app    = pyro
-        sc.client = tele
+        sc.app     = pyro
+        sc.client  = tele
         sc.userbot = userbot
+        sc.API_ID    = int(API_ID)
+        sc.API_HASH  = API_HASH
+        sc.BOT_TOKEN = BOT_TOKEN
+        logger.info("[Ruhvaan] Shared clients set.")
 
-        # Load plugins (registers all @app.on_message handlers)
-        load_plugins()
+        # 3. Load plugins (NOW app is real, handlers register correctly)
+        import importlib
+        plugin_dir = "plugins"
+        loaded = 0
+        for fname in sorted(os.listdir(plugin_dir)):
+            if fname.endswith(".py") and not fname.startswith("_"):
+                try:
+                    importlib.import_module(f"plugins.{fname[:-3]}")
+                    logger.info(f"[+] {fname}")
+                    loaded += 1
+                except Exception as e:
+                    logger.error(f"[!] {fname}: {e}")
+        logger.info(f"[Ruhvaan] {loaded} plugins loaded.")
 
-        # Start Pyrogram
+        # 4. Start Pyrogram
         await pyro.start()
         me = await pyro.get_me()
-        logger.info(f"[Ruhvaan] Bot started: @{me.username}")
+        logger.info(f"[Ruhvaan] ✅ Bot: @{me.username}")
 
-        # Start Telethon
+        # 5. Start Telethon
         await tele.start(bot_token=BOT_TOKEN)
-        logger.info("[Ruhvaan] Telethon started")
+        logger.info("[Ruhvaan] ✅ Telethon started.")
 
-        # Start userbot
+        # 6. Userbot
         if userbot:
             try:
                 await userbot.start()
-                logger.info("[Ruhvaan] Userbot started")
+                logger.info("[Ruhvaan] ✅ Userbot started.")
             except Exception as e:
                 logger.warning(f"[Ruhvaan] Userbot failed: {e}")
 
-        logger.info("[Ruhvaan] ✅ ALL SYSTEMS GO!")
+        logger.info("[Ruhvaan] 🚀 ALL SYSTEMS GO!")
         await tele.run_until_disconnected()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(_start())
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_bot())
+    except Exception as e:
+        logger.error(f"[Ruhvaan] Bot thread crashed: {e}")
+        import traceback
+        traceback.print_exc()
 
-# ── Main ────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    # Start bot in background thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    logger.info("[Ruhvaan] Bot thread started")
+    # Start bot in background
+    t = threading.Thread(target=run_bot, daemon=True)
+    t.start()
+    logger.info("[Ruhvaan] Bot thread launched.")
 
-    # Start Flask on Railway's PORT (blocks main thread = Railway happy)
+    # Flask on Railway's PORT (default 8080 if not set)
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"[Ruhvaan] Web server on port {port}")
-    flask_app.run(host="0.0.0.0", port=port)
+    logger.info(f"[Ruhvaan] Flask on port {port}")
+    flask_app.run(host="0.0.0.0", port=port, debug=False)
