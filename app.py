@@ -1,85 +1,88 @@
-# Ruhvaan Bot - Entry Point (Railway web dyno compatible)
-
+# Ruhvaan Bot - Minimal startup for Railway debug
 import asyncio
-import importlib
 import os
-import logging
 import sys
+import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-PLUGIN_DIR = "plugins"
-
-# ---- Tiny health server so Railway doesn't kill the process ----
-class HealthHandler(BaseHTTPRequestHandler):
+class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Ruhvaan Bot is running OK")
-    def log_message(self, *args): pass  # silence access logs
+        self.wfile.write(b"Ruhvaan OK")
+    def log_message(self, *a): pass
 
-def start_health_server():
+def health():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"[Ruhvaan] Health server on port {port}")
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), H).serve_forever()
 
-# ----------------------------------------------------------------
+async def main():
+    logger.info("=== RUHVAAN BOT STARTING ===")
 
-def load_plugins():
-    loaded = 0
-    for fname in sorted(os.listdir(PLUGIN_DIR)):
-        if fname.endswith(".py") and not fname.startswith("_"):
-            mod = f"{PLUGIN_DIR}.{fname[:-3]}"
-            try:
-                importlib.import_module(mod)
-                logger.info(f"[+] {fname}")
-                loaded += 1
-            except Exception as e:
-                logger.error(f"[!] {fname}: {e}")
-    logger.info(f"[Ruhvaan] {loaded} plugins loaded.")
+    # Step 1: Check env vars
+    API_ID = os.environ.get("API_ID", "")
+    API_HASH = os.environ.get("API_HASH", "")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+    MONGO_DB = os.environ.get("MONGO_DB", "")
 
-async def run():
-    from shared_client import app, client, userbot
-    from config import BOT_TOKEN
+    logger.info(f"API_ID present: {bool(API_ID)}")
+    logger.info(f"API_HASH present: {bool(API_HASH)}")
+    logger.info(f"BOT_TOKEN present: {bool(BOT_TOKEN)}")
+    logger.info(f"MONGO_DB present: {bool(MONGO_DB)}")
 
-    # Load plugins BEFORE starting (registers all handlers)
-    load_plugins()
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        logger.error("FATAL: Missing env vars! Check Railway Variables tab.")
+        sys.exit(1)
 
-    # Start Pyrogram
-    await app.start()
-    logger.info("[Ruhvaan] Pyrogram bot started.")
+    # Step 2: Import pyrogram
+    logger.info("Importing Pyrogram...")
+    try:
+        from pyrogram import Client
+        logger.info("Pyrogram import OK")
+    except Exception as e:
+        logger.error(f"Pyrogram import FAILED: {e}")
+        sys.exit(1)
 
-    # Start Telethon
-    await client.start(bot_token=BOT_TOKEN)
-    logger.info("[Ruhvaan] Telethon client started.")
+    # Step 3: Import telethon
+    logger.info("Importing Telethon...")
+    try:
+        from telethon import TelegramClient
+        logger.info("Telethon import OK")
+    except Exception as e:
+        logger.error(f"Telethon import FAILED: {e}")
+        sys.exit(1)
 
-    # Start userbot if available
-    if userbot:
-        try:
-            await userbot.start()
-            logger.info("[Ruhvaan] Userbot started.")
-        except Exception as e:
-            logger.error(f"[Ruhvaan] Userbot failed: {e}")
+    # Step 4: Start Pyrogram bot
+    logger.info("Starting Pyrogram bot...")
+    try:
+        bot = Client("ruhvaan_test", api_id=int(API_ID), api_hash=API_HASH, bot_token=BOT_TOKEN)
+        await bot.start()
+        me = await bot.get_me()
+        logger.info(f"Pyrogram OK! Bot: @{me.username}")
+    except Exception as e:
+        logger.error(f"Pyrogram start FAILED: {e}")
+        sys.exit(1)
 
-    logger.info("[Ruhvaan] ✅ Bot is LIVE!")
+    # Step 5: Start Telethon
+    logger.info("Starting Telethon...")
+    try:
+        tc = TelegramClient("ruhvaan_tl", int(API_ID), API_HASH)
+        await tc.start(bot_token=BOT_TOKEN)
+        logger.info("Telethon OK!")
+    except Exception as e:
+        logger.error(f"Telethon start FAILED: {e}")
+        sys.exit(1)
 
-    # Keep alive via Telethon
-    await client.run_until_disconnected()
+    logger.info("=== ALL SYSTEMS GO! BOT IS LIVE ===")
+    await tc.run_until_disconnected()
 
 if __name__ == "__main__":
-    # Start health server in background thread
-    t = threading.Thread(target=start_health_server, daemon=True)
-    t.start()
-
-    # Run the bot
-    try:
-        asyncio.run(run())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("[Ruhvaan] Stopped.")
+    threading.Thread(target=health, daemon=True).start()
+    asyncio.run(main())
