@@ -13,3 +13,5 @@ requests
 cryptography
 qrcode[pil]
 flask
+gunicorn
+opencv-python-headless

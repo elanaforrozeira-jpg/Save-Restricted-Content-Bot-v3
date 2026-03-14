@@ -1,10 +1,15 @@
-# Ruhvaan Bot - Minimal startup for Railway debug
-import asyncio
+# Ruhvaan Bot - Railway Optimized Entry Point
+# Railway requires a web server listening on PORT
+# Bot runs in background thread, Flask handles health checks
+
 import os
 import sys
+import asyncio
 import logging
+import importlib
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
+from flask import Flask
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -12,77 +17,106 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Ruhvaan OK")
-    def log_message(self, *a): pass
+# ── Flask app (Railway needs HTTP on PORT) ──────────────────────
+flask_app = Flask(__name__)
 
+@flask_app.route("/")
+def home():
+    return "<h1>Ruhvaan Bot ✅ Running</h1>", 200
+
+@flask_app.route("/health")
 def health():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(("0.0.0.0", port), H).serve_forever()
+    return {"status": "ok", "bot": "Ruhvaan"}, 200
 
-async def main():
-    logger.info("=== RUHVAAN BOT STARTING ===")
+# ── Plugin Loader ───────────────────────────────────────────────
+def load_plugins():
+    plugin_dir = "plugins"
+    loaded = 0
+    for fname in sorted(os.listdir(plugin_dir)):
+        if fname.endswith(".py") and not fname.startswith("_"):
+            try:
+                importlib.import_module(f"plugins.{fname[:-3]}")
+                logger.info(f"[+] {fname}")
+                loaded += 1
+            except Exception as e:
+                logger.error(f"[!] {fname} failed: {e}")
+    logger.info(f"[Ruhvaan] {loaded} plugins loaded")
 
-    # Step 1: Check env vars
-    API_ID = os.environ.get("API_ID", "")
-    API_HASH = os.environ.get("API_HASH", "")
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-    MONGO_DB = os.environ.get("MONGO_DB", "")
+# ── Bot Runner (runs in separate thread) ────────────────────────
+def run_bot():
+    async def _start():
+        # Validate env vars first
+        API_ID    = os.environ.get("API_ID", "")
+        API_HASH  = os.environ.get("API_HASH", "")
+        BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+        STRING    = os.environ.get("STRING", "") or None
 
-    logger.info(f"API_ID present: {bool(API_ID)}")
-    logger.info(f"API_HASH present: {bool(API_HASH)}")
-    logger.info(f"BOT_TOKEN present: {bool(BOT_TOKEN)}")
-    logger.info(f"MONGO_DB present: {bool(MONGO_DB)}")
+        if not API_ID or not API_HASH or not BOT_TOKEN:
+            logger.error("[FATAL] Missing API_ID / API_HASH / BOT_TOKEN")
+            sys.exit(1)
 
-    if not API_ID or not API_HASH or not BOT_TOKEN:
-        logger.error("FATAL: Missing env vars! Check Railway Variables tab.")
-        sys.exit(1)
-
-    # Step 2: Import pyrogram
-    logger.info("Importing Pyrogram...")
-    try:
         from pyrogram import Client
-        logger.info("Pyrogram import OK")
-    except Exception as e:
-        logger.error(f"Pyrogram import FAILED: {e}")
-        sys.exit(1)
-
-    # Step 3: Import telethon
-    logger.info("Importing Telethon...")
-    try:
         from telethon import TelegramClient
-        logger.info("Telethon import OK")
-    except Exception as e:
-        logger.error(f"Telethon import FAILED: {e}")
-        sys.exit(1)
 
-    # Step 4: Start Pyrogram bot
-    logger.info("Starting Pyrogram bot...")
-    try:
-        bot = Client("ruhvaan_test", api_id=int(API_ID), api_hash=API_HASH, bot_token=BOT_TOKEN)
-        await bot.start()
-        me = await bot.get_me()
-        logger.info(f"Pyrogram OK! Bot: @{me.username}")
-    except Exception as e:
-        logger.error(f"Pyrogram start FAILED: {e}")
-        sys.exit(1)
+        # Init clients
+        pyro = Client(
+            "ruhvaan_pyro",
+            api_id=int(API_ID),
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN
+        )
+        tele = TelegramClient("ruhvaan_tele", int(API_ID), API_HASH)
 
-    # Step 5: Start Telethon
-    logger.info("Starting Telethon...")
-    try:
-        tc = TelegramClient("ruhvaan_tl", int(API_ID), API_HASH)
-        await tc.start(bot_token=BOT_TOKEN)
-        logger.info("Telethon OK!")
-    except Exception as e:
-        logger.error(f"Telethon start FAILED: {e}")
-        sys.exit(1)
+        userbot = None
+        if STRING:
+            userbot = Client(
+                "ruhvaan_userbot",
+                api_id=int(API_ID),
+                api_hash=API_HASH,
+                session_string=STRING
+            )
 
-    logger.info("=== ALL SYSTEMS GO! BOT IS LIVE ===")
-    await tc.run_until_disconnected()
+        # Share globally so plugins can import
+        import shared_client as sc
+        sc.app    = pyro
+        sc.client = tele
+        sc.userbot = userbot
 
+        # Load plugins (registers all @app.on_message handlers)
+        load_plugins()
+
+        # Start Pyrogram
+        await pyro.start()
+        me = await pyro.get_me()
+        logger.info(f"[Ruhvaan] Bot started: @{me.username}")
+
+        # Start Telethon
+        await tele.start(bot_token=BOT_TOKEN)
+        logger.info("[Ruhvaan] Telethon started")
+
+        # Start userbot
+        if userbot:
+            try:
+                await userbot.start()
+                logger.info("[Ruhvaan] Userbot started")
+            except Exception as e:
+                logger.warning(f"[Ruhvaan] Userbot failed: {e}")
+
+        logger.info("[Ruhvaan] ✅ ALL SYSTEMS GO!")
+        await tele.run_until_disconnected()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_start())
+
+# ── Main ────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    threading.Thread(target=health, daemon=True).start()
-    asyncio.run(main())
+    # Start bot in background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    logger.info("[Ruhvaan] Bot thread started")
+
+    # Start Flask on Railway's PORT (blocks main thread = Railway happy)
+    port = int(os.environ.get("PORT", 8080))
+    logger.info(f"[Ruhvaan] Web server on port {port}")
+    flask_app.run(host="0.0.0.0", port=port)
